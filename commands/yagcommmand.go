@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	log "github.com/Sirupsen/logrus"
+	"github.com/jonas747/dcmd"
 	"github.com/jonas747/discordgo"
-	"github.com/jonas747/dutil/commandsystem"
 	"github.com/jonas747/dutil/dstate"
 	"github.com/jonas747/yagpdb/bot"
 	"github.com/jonas747/yagpdb/common"
@@ -21,14 +21,37 @@ const (
 	CtxKeyRedisClient ContextKey = iota
 )
 
-type CommandCategory string
-
-const (
-	CategoryGeneral    CommandCategory = "General"
-	CategoryTool       CommandCategory = "Tools"
-	CategoryModeration CommandCategory = "Moderation"
-	CategoryFun        CommandCategory = "Misc/Fun"
-	CategoryDebug      CommandCategory = "Debug"
+var (
+	CategoryGeneral = &dcmd.Category{
+		Name:        "General",
+		Description: "General commands",
+		HelpEmoji:   "ℹ️",
+		EmbedColor:  0xe53939,
+	}
+	CategoryTool = &dcmd.Category{
+		Name:        "Tools",
+		Description: "Various miscellaneous commands",
+		HelpEmoji:   "🔨",
+		EmbedColor:  0xeaed40,
+	}
+	CategoryModeration = &dcmd.Category{
+		Name:        "Moderation",
+		Description: "Moderation commands",
+		HelpEmoji:   "👮",
+		EmbedColor:  0xdb0606,
+	}
+	CategoryFun = &dcmd.Category{
+		Name:        "Fun",
+		Description: "Various commands meant for entertainment",
+		HelpEmoji:   "🎉",
+		EmbedColor:  0x5ae26c,
+	}
+	CategoryDebug = &dcmd.Category{
+		Name:        "Debug",
+		Description: "Debug and other commands to inspect the bot",
+		HelpEmoji:   "🖥",
+		EmbedColor:  0,
+	}
 )
 
 var (
@@ -40,22 +63,55 @@ var (
 
 // Slight extension to the simplecommand, it will check if the command is enabled in the HandleCommand func
 // And invoke a custom handlerfunc with provided redis client
-type CustomCommand struct {
-	*commandsystem.Command
+type YAGCommand struct {
+	Name            string   // Name of command, what its called from
+	Aliases         []string // Aliases which it can also be called from
+	Description     string   // Description shown in non targetted help
+	LongDescription string   // Longer description when this command was targetted
+
+	Arguments      []*dcmd.ArgDef // Slice of argument definitions, ctx.Args will always be the same size as this slice (although the data may be nil)
+	RequiredArgs   int            // Number of reuquired arguments, ignored if combos is specified
+	ArgumentCombos [][]int        // Slice of argument pairs, will override RequiredArgs if specified
+	ArgSwitches    []*dcmd.ArgDef // Switches for the commadn to use
+
+	AllowEveryoneMention bool
+
 	HideFromCommandsPage bool   // Set to  hide this command from the commands page
 	Key                  string // GuildId is appended to the key, e.g if key is "test:", it will check for "test:<guildid>"
 	CustomEnabled        bool   // Set to true to handle the enable check itself
 	Default              bool   // The default state of this command
 	Cooldown             int    // Cooldown in seconds before user can use it again
-	Category             CommandCategory
+	CommandCategory      *dcmd.Category
+
+	// Run is ran the the command has sucessfully been parsed
+	// It returns a reply and an error
+	// the reply can have a type of string, *MessageEmbed or error
+	RunFunc dcmd.RunFunc
 }
 
-func (cs *CustomCommand) HandleCommand(raw string, trigger *commandsystem.TriggerData, ctx context.Context) ([]*discordgo.Message, error) {
+// CmdWithCategory puts the command in a category, mostly used for the help generation
+func (yc *YAGCommand) Category() *dcmd.Category {
+	return yc.CommandCategory
+}
+
+func (yc *YAGCommand) Descriptions(data *dcmd.Data) (short, long string) {
+	return yc.Description, yc.LongDescription
+}
+
+func (yc *YAGCommand) ArgDefs(data *dcmd.Data) (args []*dcmd.ArgDef, required int, combos [][]int) {
+	return yc.Arguments, yc.RequiredArgs, yc.ArgumentCombos
+}
+
+func (yc *YAGCommand) Switches() []*dcmd.ArgDef {
+	return yc.ArgSwitches
+}
+
+func (yc *YAGCommand) Run(data *dcmd.Data) (interface{}, error) {
 
 	// Track how long execution of a command took
 	started := time.Now()
 	defer func() {
-		cs.logExecutionTime(time.Since(started), raw, trigger.Message.Author.Username)
+		yc.logExecutionTime(time.Since(started), raw, trigger.Message.Author.Username)
 	}()
 
 	// Need a redis client to check cooldowns and retrieve command settings
@@ -66,11 +122,11 @@ func (cs *CustomCommand) HandleCommand(raw string, trigger *commandsystem.Trigge
 	}
 	defer common.RedisPool.Put(client)
 
-	err = common.BlockingLockRedisKey(client, RKeyCommandLock(trigger.Message.Author.ID, cs.Name), CommandExecTimeout*2, int((CommandExecTimeout + time.Second).Seconds()))
+	err = common.BlockingLockRedisKey(client, RKeyCommandLock(trigger.Message.Author.ID, yc.Name), CommandExecTimeout*2, int((CommandExecTimeout + time.Second).Seconds()))
 	if err != nil {
 		return nil, errors.WithMessage(err, "Failed locking command")
 	}
-	defer common.UnlockRedisKey(client, RKeyCommandLock(trigger.Message.Author.ID, cs.Name))
+	defer common.UnlockRedisKey(client, RKeyCommandLock(trigger.Message.Author.ID, yc.Name))
 
 	cState := bot.State.Channel(true, trigger.Message.ChannelID)
 	if cState == nil {
@@ -82,7 +138,7 @@ func (cs *CustomCommand) HandleCommand(raw string, trigger *commandsystem.Trigge
 		UserID:    trigger.Message.Author.ID,
 		ChannelID: cState.ID(),
 
-		Command:    cs.Name,
+		Command:    yc.Name,
 		RawCommand: raw,
 		TimeStamp:  time.Now(),
 	}
@@ -91,7 +147,7 @@ func (cs *CustomCommand) HandleCommand(raw string, trigger *commandsystem.Trigge
 		logEntry.GuildID = cState.Guild.ID()
 	}
 
-	resp, autoDel := cs.checkCanExecuteCommand(trigger, client, cState)
+	resp, autoDel := yc.checkCanExecuteCommand(trigger, client, cState)
 	if resp != "" {
 		m, err := common.BotSession.ChannelMessageSend(cState.ID(), resp)
 		if m != nil {
@@ -106,28 +162,28 @@ func (cs *CustomCommand) HandleCommand(raw string, trigger *commandsystem.Trigge
 	defer cancelExec()
 
 	// Run the command
-	replies, err := cs.Command.HandleCommand(raw, trigger, context.WithValue(runCtx, CtxKeyRedisClient, client))
+	replies, err := yc.Command.HandleCommand(raw, trigger, context.WithValue(runCtx, CtxKeyRedisClient, client))
 
 	if err != nil {
 		if errors.Cause(err) == context.Canceled || errors.Cause(err) == context.DeadlineExceeded {
 			common.BotSession.ChannelMessageSend(cState.Channel.ID, "Took longer than "+CommandExecTimeout.String()+" to handle command: `"+common.EscapeSpecialMentions(raw)+"`, Cancelled the command.")
 		} else {
 			logEntry.Error = err.Error()
-			log.WithError(err).WithField("channel", cState.ID()).Error(cs.Name, ": failed handling command")
+			log.WithError(err).WithField("channel", cState.ID()).Error(yc.Name, ": failed handling command")
 		}
 	}
 
 	logEntry.ResponseTime = int64(time.Since(started))
 
 	if len(replies) > 0 && autoDel {
-		go cs.deleteResponse(append(replies, trigger.Message))
+		go yc.deleteResponse(append(replies, trigger.Message))
 	} else if autoDel {
-		go cs.deleteResponse([]*discordgo.Message{trigger.Message})
+		go yc.deleteResponse([]*discordgo.Message{trigger.Message})
 	}
 
 	// Log errors
 	if err == nil {
-		err = cs.SetCooldown(client, trigger.Message.Author.ID)
+		err = yc.SetCooldown(client, trigger.Message.Author.ID)
 		if err != nil {
 			log.WithError(err).Error("Failed setting cooldown")
 		}
@@ -143,7 +199,7 @@ func (cs *CustomCommand) HandleCommand(raw string, trigger *commandsystem.Trigge
 }
 
 // checkCanExecuteCommand returns a non empty string if this user cannot execute this command
-func (cs *CustomCommand) checkCanExecuteCommand(trigger *commandsystem.TriggerData, client *redis.Client, cState *dstate.ChannelState) (resp string, autoDel bool) {
+func (cs *YAGCommand) checkCanExecuteCommand(trigger *commandsystem.TriggerData, client *redis.Client, cState *dstate.ChannelState) (resp string, autoDel bool) {
 	// Check guild specific settings if not triggered from a DM
 	var guild *dstate.GuildState
 
@@ -208,11 +264,11 @@ func (cs *CustomCommand) checkCanExecuteCommand(trigger *commandsystem.TriggerDa
 	return
 }
 
-func (cs *CustomCommand) logExecutionTime(dur time.Duration, raw string, sender string) {
+func (cs *YAGCommand) logExecutionTime(dur time.Duration, raw string, sender string) {
 	log.Infof("Handled Command [%4dms] %s: %s", int(dur.Seconds()*1000), sender, raw)
 }
 
-func (cs *CustomCommand) deleteResponse(msgs []*discordgo.Message) {
+func (cs *YAGCommand) deleteResponse(msgs []*discordgo.Message) {
 	ids := make([]string, len(msgs))
 	for k, msg := range msgs {
 		ids[k] = msg.ID
@@ -233,7 +289,7 @@ func (cs *CustomCommand) deleteResponse(msgs []*discordgo.Message) {
 }
 
 // customEnabled returns wether the command is enabled by it's custom key or not
-func (cs *CustomCommand) customEnabled(client *redis.Client, guildID string) (bool, error) {
+func (cs *YAGCommand) customEnabled(client *redis.Client, guildID string) (bool, error) {
 	// No special key so it's automatically enabled
 	if cs.Key == "" || cs.CustomEnabled {
 		return true, nil
@@ -259,7 +315,7 @@ func (cs *CustomCommand) customEnabled(client *redis.Client, guildID string) (bo
 }
 
 // Enabled returns wether the command is enabled or not
-func (cs *CustomCommand) Enabled(client *redis.Client, channel string, gState *dstate.GuildState) (enabled bool, requiredRole string, autodel bool, err error) {
+func (cs *YAGCommand) Enabled(client *redis.Client, channel string, gState *dstate.GuildState) (enabled bool, requiredRole string, autodel bool, err error) {
 	gState.RLock()
 	defer gState.RUnlock()
 
@@ -317,7 +373,7 @@ func (cs *CustomCommand) Enabled(client *redis.Client, channel string, gState *d
 }
 
 // CooldownLeft returns the number of seconds before a command can be used again
-func (cs *CustomCommand) CooldownLeft(client *redis.Client, userID string) (int, error) {
+func (cs *YAGCommand) CooldownLeft(client *redis.Client, userID string) (int, error) {
 	if cs.Cooldown < 1 || common.Testing {
 		return 0, nil
 	}
@@ -331,7 +387,7 @@ func (cs *CustomCommand) CooldownLeft(client *redis.Client, userID string) (int,
 }
 
 // SetCooldown sets the cooldown of the command as it's defined in the struct
-func (cs *CustomCommand) SetCooldown(client *redis.Client, userID string) error {
+func (cs *YAGCommand) SetCooldown(client *redis.Client, userID string) error {
 	if cs.Cooldown < 1 {
 		return nil
 	}
